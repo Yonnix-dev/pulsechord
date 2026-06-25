@@ -177,7 +177,7 @@
         </button>
         <div class="rec-timer" id="rec-timer">00:00</div>
         <button class="btn-stop" id="btn-stop" disabled>&#9646;&#9646; STOP</button>
-        <button class="btn-export" id="btn-export" disabled>&#8681; Export</button>
+        <button class="btn-export" id="btn-export" disabled>&#8681; Export MP3</button>
         <div class="rec-info" id="rec-info">Lance une REC puis joue.</div>
       </div>
 
@@ -216,6 +216,8 @@
 
   </main>
 
+  <!-- lamejs pour export MP3 320kbps côté navigateur -->
+  <script src="https://cdn.jsdelivr.net/npm/@breezystack/lamejs@1.2.7/lame.min.js"></script>
   <script src="./audio.js"></script>
   <script src="./app.js"></script>
 </body>
