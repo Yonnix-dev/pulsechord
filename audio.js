@@ -1,266 +1,299 @@
-/* =============================================
+/* ============================================
    PulseChord — Audio Engine
-   Web Audio API : synthèse + effets + recorder
-============================================= */
+   Omnichord-style : harp strum + sustain
+   Web Audio API only, no dependencies
+============================================ */
 
 const Audio = (() => {
+
+  // ─ Contexte & nœuds ──────────────────────────────
   let ctx = null;
-  let masterGain, filterNode, distNode, reverbNode, delayNode, delayGain, reverbGain, analyser;
-  let mediaDestination;
+  let masterGain, filterNode, reverbGain, reverbNode,
+      delayNode, delayFeedback, delayGainNode, analyser,
+      mediaDestination;
   let mediaRecorder = null;
   let recordedChunks = [];
-  let lastNote = null;
 
-  const params = {
-    waveform: 'sawtooth',
-    attack: 0.01,
-    release: 0.4,
-    octave: 4,
-    detune: 0,
-    glide: 0,
-    filter: 8000,
-    resonance: 1,
-    reverb: 0.2,
-    delay: 0,
-    distortion: 0,
-    bitcrush: 16,
-    volume: 0.8,
-    engine: 'lead'
+  // ─ Paramètres ───────────────────────────────────
+  const p = {
+    preset:    'omnicord',
+    octave:    4,
+    filter:    8000,
+    reverb:    0.2,
+    delay:     0,
+    volume:    0.8,
+    strumMs:   60,    // délai entre chaque note du strum (ms)
+    sustain:   2.0,   // durée de sustain des cordes (s)
+    attack:    0.005,
+    release:   1.2,
   };
 
-  function ensureContext() {
-    if (!ctx) init();
-  }
+  // ─ Presets ────────────────────────────────────
+  const PRESETS = {
+    omnicord: {
+      waveform: 'sine',
+      attack: 0.005, sustain: 2.0, release: 1.5,
+      filter: 9000,  reverb: 0.3,  delay: 0,
+      strumMs: 55,   volume: 0.8,
+      // Léger détune pour le chorus naturel de l'Omnichord
+      detune: 0, chorus: true,
+    },
+    electric: {
+      waveform: 'sawtooth',
+      attack: 0.008, sustain: 1.2, release: 0.8,
+      filter: 4000,  reverb: 0.15, delay: 0.25,
+      strumMs: 40,   volume: 0.85,
+      detune: 5, chorus: false,
+    },
+    ambient: {
+      waveform: 'sine',
+      attack: 0.4,   sustain: 4.0, release: 3.0,
+      filter: 14000, reverb: 0.75, delay: 0.4,
+      strumMs: 90,   volume: 0.7,
+      detune: 0, chorus: true,
+    },
+    bass: {
+      waveform: 'square',
+      attack: 0.01,  sustain: 0.8, release: 0.5,
+      filter: 900,   reverb: 0.08, delay: 0.1,
+      strumMs: 30,   volume: 0.9,
+      detune: -2400, chorus: false, // octave -2
+    },
+    bells: {
+      waveform: 'triangle',
+      attack: 0.001, sustain: 3.0, release: 2.5,
+      filter: 16000, reverb: 0.5,  delay: 0.2,
+      strumMs: 80,   volume: 0.75,
+      detune: 1200,  chorus: false, // octave +1
+    },
+  };
 
-  function init() {
+  // ─ Init contexte ──────────────────────────────
+  function ensureContext() {
+    if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return; }
     ctx = new (window.AudioContext || window.webkitAudioContext)();
 
     masterGain = ctx.createGain();
-    masterGain.gain.value = params.volume;
+    masterGain.gain.value = p.volume;
 
-    // Filtre low-pass
     filterNode = ctx.createBiquadFilter();
     filterNode.type = 'lowpass';
-    filterNode.frequency.value = params.filter;
-    filterNode.Q.value = params.resonance;
+    filterNode.frequency.value = p.filter;
+    filterNode.Q.value = 0.8;
 
-    // Distorsion (waveshaper)
-    distNode = ctx.createWaveShaper();
-    distNode.curve = makeDistortionCurve(params.distortion);
-    distNode.oversample = '4x';
-
-    // Reverb (convolver avec IR aléatoire)
+    // Reverb (impulse response aléatoire)
     reverbNode = ctx.createConvolver();
-    reverbNode.buffer = makeReverbBuffer(ctx, 2.5);
+    reverbNode.buffer = makeIR(2.8);
     reverbGain = ctx.createGain();
-    reverbGain.gain.value = params.reverb;
+    reverbGain.gain.value = p.reverb;
 
-    // Delay avec feedback
-    delayNode = ctx.createDelay(2);
-    delayNode.delayTime.value = 0.375;
-    delayGain = ctx.createGain();
-    delayGain.gain.value = params.delay;
+    // Delay
+    delayNode = ctx.createDelay(2.0);
+    delayNode.delayTime.value = 0.36;
+    delayFeedback = ctx.createGain();
+    delayFeedback.gain.value = 0.38;
+    delayGainNode = ctx.createGain();
+    delayGainNode.gain.value = p.delay;
 
-    // Analyser pour le visualiseur
+    // Analyser
     analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
-    analyser.smoothingTimeConstant = 0.8;
+    analyser.smoothingTimeConstant = 0.82;
 
-    // Routage signal
-    filterNode.connect(distNode);
-    distNode.connect(masterGain);
+    // Routage
+    filterNode.connect(masterGain);
+
     masterGain.connect(analyser);
+    analyser.connect(ctx.destination);
 
-    // Send reverb
+    // Reverb send
     masterGain.connect(reverbGain);
     reverbGain.connect(reverbNode);
     reverbNode.connect(analyser);
 
-    // Send delay avec feedback
-    masterGain.connect(delayGain);
-    delayGain.connect(delayNode);
-    delayNode.connect(delayGain);
+    // Delay send avec feedback
+    masterGain.connect(delayGainNode);
+    delayGainNode.connect(delayNode);
+    delayNode.connect(delayFeedback);
+    delayFeedback.connect(delayNode);
     delayNode.connect(analyser);
 
-    // Sortie haut-parleurs
-    analyser.connect(ctx.destination);
-
-    // Sortie pour enregistrement
+    // Sortie enregistrement
     mediaDestination = ctx.createMediaStreamDestination();
     analyser.connect(mediaDestination);
   }
 
-  function makeDistortionCurve(amount) {
-    const k = typeof amount === 'number' ? amount : 0;
-    const n = 256;
-    const curve = new Float32Array(n);
-    if (k === 0) {
-      for (let i = 0; i < n; i++) curve[i] = (2 * i) / n - 1;
-      return curve;
-    }
-    for (let i = 0; i < n; i++) {
-      const x = (2 * i) / n - 1;
-      curve[i] = ((3 + k) * x * 20 * (Math.PI / 180)) / (Math.PI + k * Math.abs(x));
-    }
-    return curve;
-  }
-
-  function makeReverbBuffer(context, duration) {
-    const sr  = context.sampleRate;
+  // ─ Impulse Response (reverb) ───────────────────
+  function makeIR(duration) {
+    ensureContext();
+    const sr  = ctx.sampleRate;
     const len = Math.floor(sr * duration);
-    const buf = context.createBuffer(2, len, sr);
+    const buf = ctx.createBuffer(2, len, sr);
     for (let c = 0; c < 2; c++) {
       const d = buf.getChannelData(c);
-      for (let i = 0; i < len; i++) {
-        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
-      }
+      for (let i = 0; i < len; i++)
+        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.5);
     }
     return buf;
   }
 
-  function midiToHz(midi) {
-    return 440 * Math.pow(2, (midi - 69) / 12);
-  }
+  // ─ Utilitaires ────────────────────────────────
+  function midiToHz(midi) { return 440 * Math.pow(2, (midi - 69) / 12); }
 
-  const NOTE_MAP = { C:0,'C#':1,Db:1,D:2,'D#':3,Eb:3,E:4,F:5,'F#':6,Gb:6,G:7,'G#':8,Ab:8,A:9,'A#':10,Bb:10,B:11 };
-  function noteToMidi(name, octave) {
-    return (NOTE_MAP[name] || 0) + (octave + 1) * 12;
-  }
+  const NOTE_IDX = { C:0,'C#':1,Db:1,D:2,'D#':3,Eb:3,E:4,F:5,'F#':6,Gb:6,G:7,'G#':8,Ab:8,A:9,'A#':10,Bb:10,B:11 };
+  function noteToMidi(name, octave) { return (NOTE_IDX[name] || 0) + (octave + 1) * 12; }
 
-  const ENGINE_PRESETS = {
-    lead:  { waveform: 'sawtooth',  attack: 0.005, release: 0.3  },
-    pad:   { waveform: 'sine',      attack: 0.3,   release: 1.5  },
-    bass:  { waveform: 'square',    attack: 0.01,  release: 0.2  },
-    keys:  { waveform: 'triangle',  attack: 0.01,  release: 0.6  }
-  };
+  // ─ Jouer une note (une seule corde) ─────────────
+  function playString(freq, startTime, preset) {
+    const pr = PRESETS[preset] || PRESETS.omnicord;
+    const now = startTime;
 
-  function applyEngine(engine) {
-    const p = ENGINE_PRESETS[engine];
-    if (!p) return;
-    params.waveform = p.waveform;
-    params.attack   = p.attack;
-    params.release  = p.release;
-  }
+    const osc  = ctx.createOscillator();
+    const env  = ctx.createGain();
 
-  function playNote(noteOrHz, durationSec = null) {
-    ensureContext();
-    if (ctx.state === 'suspended') ctx.resume();
+    osc.type = pr.waveform;
+    // Détune de base du preset
+    osc.detune.value = pr.detune || 0;
 
-    let freq;
-    if (typeof noteOrHz === 'number') {
-      freq = noteOrHz;
-    } else {
-      freq = midiToHz(noteToMidi(noteOrHz, params.octave));
-    }
-    freq = Math.max(20, Math.min(20000, freq));
+    // Chorus naturel : léger détune aléatoire par corde
+    if (pr.chorus) osc.detune.value += (Math.random() - 0.5) * 6;
 
-    const now    = ctx.currentTime;
-    const osc    = ctx.createOscillator();
-    const env    = ctx.createGain();
+    osc.frequency.setValueAtTime(freq, now);
 
-    osc.type = params.waveform;
-    osc.detune.setValueAtTime(params.detune, now);
-
-    if (params.glide > 0 && lastNote) {
-      osc.frequency.setValueAtTime(lastNote, now);
-      osc.frequency.linearRampToValueAtTime(freq, now + params.glide);
-    } else {
-      osc.frequency.setValueAtTime(freq, now);
-    }
-    lastNote = freq;
-
-    // Envelope ADSR simplifiée
+    // Envelope : attack rapide, sustain, release longue
     env.gain.setValueAtTime(0, now);
-    env.gain.linearRampToValueAtTime(1, now + params.attack);
-    env.gain.setValueAtTime(1, now + params.attack + 0.01);
+    env.gain.linearRampToValueAtTime(0.18, now + pr.attack);
+    env.gain.setValueAtTime(0.18, now + pr.attack + pr.sustain * 0.2);
+    env.gain.exponentialRampToValueAtTime(0.001, now + pr.attack + pr.sustain + pr.release);
 
-    if (durationSec) {
-      const offAt = now + durationSec;
-      env.gain.setTargetAtTime(0, offAt, params.release / 4);
-      osc.start(now);
-      osc.stop(offAt + params.release + 0.6);
-    } else {
-      osc.start(now);
-    }
+    osc.start(now);
+    osc.stop(now + pr.attack + pr.sustain + pr.release + 0.1);
 
     osc.connect(env);
     env.connect(filterNode);
 
-    return { osc, env, startTime: now };
+    return { osc, env };
   }
 
+  // ─ Strum d'accord (Omnichord-style) ────────────
+  // freqs : tableau de fréquences (toutes les cordes de l'accord)
+  // direction : 'up' | 'down' | 'both'
+  function strumChord(freqs, direction = 'up') {
+    ensureContext();
+    if (ctx.state === 'suspended') ctx.resume();
+    const pr   = PRESETS[p.preset] || PRESETS.omnicord;
+    const step = (p.strumMs / 1000);
+    const now  = ctx.currentTime;
+    const handles = [];
+
+    let ordered = [...freqs];
+    if (direction === 'down') ordered = ordered.reverse();
+
+    ordered.forEach((freq, i) => {
+      const h = playString(freq, now + i * step, p.preset);
+      handles.push(h);
+    });
+    return handles;
+  }
+
+  // ─ Note mélodie (sustain tant que touché) ────────
+  function playNote(freq) {
+    ensureContext();
+    if (ctx.state === 'suspended') ctx.resume();
+    const pr  = PRESETS[p.preset] || PRESETS.omnicord;
+    const now = ctx.currentTime;
+
+    const osc = ctx.createOscillator();
+    const env = ctx.createGain();
+
+    osc.type = pr.waveform;
+    osc.detune.value = (pr.detune || 0) + (pr.chorus ? (Math.random() - 0.5) * 4 : 0);
+    osc.frequency.setValueAtTime(freq, now);
+
+    env.gain.setValueAtTime(0, now);
+    env.gain.linearRampToValueAtTime(0.22, now + pr.attack);
+
+    osc.start(now);
+    osc.connect(env);
+    env.connect(filterNode);
+
+    return { osc, env };
+  }
+
+  // Arrêter une note mélodie (release douce)
   function stopNote(handle) {
-    if (!handle) return;
+    if (!handle || !ctx) return;
     const { env, osc } = handle;
     const now = ctx.currentTime;
+    const pr  = PRESETS[p.preset] || PRESETS.omnicord;
     env.gain.cancelScheduledValues(now);
-    env.gain.setTargetAtTime(0, now, params.release / 4);
-    try { osc.stop(now + params.release + 0.2); } catch(e) {}
+    env.gain.setTargetAtTime(0, now, pr.release / 5);
+    try { osc.stop(now + pr.release + 0.3); } catch(e) {}
   }
 
-  function playChord(notes, durationSec = 0.8) {
-    ensureContext();
-    return notes.map(n => playNote(n, durationSec));
+  // ─ Appliquer un preset ──────────────────────────
+  function setPreset(name) {
+    const pr = PRESETS[name];
+    if (!pr) return;
+    p.preset  = name;
+    p.filter  = pr.filter;
+    p.reverb  = pr.reverb;
+    p.delay   = pr.delay;
+    p.sustain = pr.sustain;
+    p.strumMs = pr.strumMs;
+    p.volume  = pr.volume;
+    if (!ctx) return;
+    filterNode.frequency.setTargetAtTime(pr.filter, ctx.currentTime, 0.05);
+    reverbGain.gain.setTargetAtTime(pr.reverb, ctx.currentTime, 0.05);
+    delayGainNode.gain.setTargetAtTime(pr.delay, ctx.currentTime, 0.05);
+    masterGain.gain.setTargetAtTime(pr.volume, ctx.currentTime, 0.05);
   }
 
+  // ─ Setters paramètres individuels ────────────────
   function setParam(key, value) {
-    params[key] = value;
+    p[key] = value;
     if (!ctx) return;
     switch (key) {
-      case 'volume':     masterGain.gain.setTargetAtTime(value, ctx.currentTime, 0.01); break;
-      case 'filter':     filterNode.frequency.setTargetAtTime(value, ctx.currentTime, 0.02); break;
-      case 'resonance':  filterNode.Q.setTargetAtTime(value, ctx.currentTime, 0.02); break;
-      case 'reverb':     reverbGain.gain.setTargetAtTime(value, ctx.currentTime, 0.02); break;
-      case 'delay':      delayGain.gain.setTargetAtTime(Math.min(value, 0.7), ctx.currentTime, 0.02); break;
-      case 'distortion': distNode.curve = makeDistortionCurve(value); break;
+      case 'volume':  masterGain.gain.setTargetAtTime(value, ctx.currentTime, 0.02); break;
+      case 'filter':  filterNode.frequency.setTargetAtTime(value, ctx.currentTime, 0.03); break;
+      case 'reverb':  reverbGain.gain.setTargetAtTime(value, ctx.currentTime, 0.03); break;
+      case 'delay':   delayGainNode.gain.setTargetAtTime(Math.min(value, 0.75), ctx.currentTime, 0.03); break;
     }
   }
 
-  function setEngine(engine) {
-    params.engine = engine;
-    applyEngine(engine);
-  }
-
-  // Recorder — capture la sortie audio de l'app directement
+  // ─ Recorder ───────────────────────────────────
   function startRecording() {
     ensureContext();
     recordedChunks = [];
     const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus'
-      : 'audio/webm';
+      ? 'audio/webm;codecs=opus' : 'audio/webm';
     mediaRecorder = new MediaRecorder(mediaDestination.stream, {
-      mimeType: mime,
-      audioBitsPerSecond: 256000
+      mimeType: mime, audioBitsPerSecond: 256000
     });
-    mediaRecorder.ondataavailable = e => {
-      if (e.data.size > 0) recordedChunks.push(e.data);
-    };
+    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
     mediaRecorder.start(100);
   }
 
   function stopRecording() {
     return new Promise(resolve => {
       if (!mediaRecorder) { resolve(null); return; }
-      mediaRecorder.onstop = () => {
-        const blob = new Blob(recordedChunks, { type: 'audio/webm' });
-        resolve(blob);
-      };
+      mediaRecorder.onstop = () => resolve(new Blob(recordedChunks, { type: 'audio/webm' }));
       mediaRecorder.stop();
     });
   }
 
-  function getAnalyser() {
-    ensureContext();
-    return analyser;
-  }
-
-  function getParams() { return { ...params }; }
+  // ─ Getters ────────────────────────────────────
+  function getAnalyser() { ensureContext(); return analyser; }
+  function getParams()   { return { ...p }; }
+  function getPresets()  { return Object.keys(PRESETS); }
 
   return {
-    init, ensureContext, playNote, stopNote, playChord,
-    setParam, setEngine, applyEngine,
+    ensureContext,
+    playNote, stopNote,
+    strumChord,
+    setPreset, setParam,
     startRecording, stopRecording,
-    getAnalyser, getParams,
-    midiToHz, noteToMidi, ENGINE_PRESETS
+    getAnalyser, getParams, getPresets,
+    midiToHz, noteToMidi,
   };
 })();
